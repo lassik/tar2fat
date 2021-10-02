@@ -1,3 +1,9 @@
+(define (filter p list)
+  (let loop ((newlist '()) (list list))
+    (if (null? list) (reverse newlist)
+        (loop (if (p (car list)) (cons (car list) newlist) newlist)
+              (cdr list)))))
+
 (define (find p list)
   (cond ((null? list) #f)
         ((p (car list)) (car list))
@@ -9,6 +15,22 @@
         (if (null? (cdr list)) (reverse newlist)
             (loop (cons (car list) newlist) (cdr list))))))
 
+(define (bytevector-concatenate bytevectors)
+  (fold (lambda (part whole) (bytevector-append whole part))
+        (bytevector) bytevectors))
+
+(define (string-index str char)
+  (let loop ((i 0))
+    (cond ((= i (string-length str)) #f)
+          ((char=? char (string-ref str i)) i)
+          (else (loop (+ i 1))))))
+
+(define (string-every? p str)
+  (let loop ((i 0))
+    (or (= i (string-length str))
+        (and (p (string-ref str i))
+             (loop (+ i 1))))))
+
 (define (string-prefix? fix str)
   (let ((fixlen (string-length fix))
         (strlen (string-length str)))
@@ -19,36 +41,68 @@
 (define (string-drop str n)
   (string-copy str n (string-length str)))
 
+(define (string-pad str n char)
+  (let ((lack (- n (string-length str))))
+    (if (<= lack 0) str (string-append str (make-string lack char)))))
+
+(define (u8 u)
+  (bytevector u))
+
+(define (u16l u)
+  (bytevector (bitwise-and #xff u)
+              (bitwise-and #xff (arithmetic-shift u -8))))
+
+(define (u32l u)
+  (bytevector (bitwise-and #xff u)
+              (bitwise-and #xff (arithmetic-shift u -8))
+              (bitwise-and #xff (arithmetic-shift u -16))
+              (bitwise-and #xff (arithmetic-shift u -24))))
+
 ;;
+
+(define bytes/sector 512)  ; Do not change.
+(define sectors/cluster 8)
 
 (define-record-type fat-directory
   (make-fat-directory* name entries)
   fat-directory?
   (name fat-directory-name)
-  (entries fat-directory-entries fat-directory-set-entries!))
+  (entries fat-directory-entries fat-directory-set-entries!)
+  (first-cluster fat-directory-first-cluster
+                 fat-directory-set-first-cluster!))
 
 (define-record-type fat-file
   (make-fat-file name contents)
   fat-file?
   (name fat-file-name)
-  (contents fat-file-contents))
+  (contents fat-file-contents)
+  (first-cluster fat-file-first-cluster fat-file-set-first-cluster!))
 
 (define-record-type drive
   (make-drive* number root-directory)
   drive?
   (number drive-number)
+  (first-sector drive-first-sector)
+  (sector-count drive-sector-count drive-set-sector-count!)
+  (max-space drive-max-space)
+  (free-space drive-free-space)
   (root-directory drive-root-directory))
 
-(define first-drive-letter #\C)
-(define last-drive-letter #\F)
+(define first-drive-letter #\c)
+(define last-drive-letter #\f)
 
 (define max-drives
-  (- (char->integer last-drive-letter) (char->integer first-drive-letter)))
+  (+ 1 (- (char->integer last-drive-letter)
+          (char->integer first-drive-letter))))
 
 (define drives (make-vector max-drives #f))
 
+(define (get-used-drives)
+  (filter drive? (vector->list drives)))
+
 (define (drive-letter drive)
-  (integer->char (+ (char->integer first-drive-letter) (drive-number drive))))
+  (string (integer->char (+ (char->integer first-drive-letter)
+                            (drive-number drive)))))
 
 (define (drive-by-letter letter)
   (let ((number (- (char->integer letter) first-drive-letter)))
@@ -121,6 +175,12 @@
                  (loop entry (cdr path)))
                 (else
                  (error "Can't decide if entry is file or directory")))))))
+
+(define (fat-file-size file)
+  (bytevector-length (fat-file-contents file)))
+
+(define (fat-file-clusters file)
+  (ceiling (/ (fat-file-size file) (* bytes/sector sectors/cluster))))
 
 (define (tar-read-entry)
 
@@ -199,23 +259,7 @@
                   (loop a (+ b 1) parts))))))
     parts))
 
-(define (dump-drive letter)
-  (define (emit nest str)
-    (write-string (make-string (* 2 nest) #\space))
-    (write-string str)
-    (newline))
-  (define (dump-directory-entries nest directory)
-    (for-each (lambda (entry)
-                (emit nest (fat-directory-entry-name entry))
-                (when (fat-directory? entry)
-                  (dump-directory-entries (+ nest 1) entry)))
-              (fat-directory-entries directory)))
-  (let ((drive (get-drive letter)))
-    (when drive
-      (emit 0 letter)
-      (dump-directory-entries 1 (drive-root-directory drive)))))
-
-(define (handle-entry entry)
+(define (input-entry entry)
   (let ((path (tar-split-path (cdr (assq 'path entry)))))
     (when (null? path)
       (error "blank path in tar file"))
@@ -237,12 +281,105 @@
                      (make-fat-file name
                                     (cdr (assq 'contents entry)))))))))))))
 
-(define (main)
+(define (input)
   (let loop ()
     (let ((entry (tar-read-entry)))
       (unless (eof-object? entry)
-        (handle-entry entry)
+        (input-entry entry)
         (loop)))))
 
+(define (build-file-allocation-table drive)
+  (let ((next-free-cluster 0))
+    (define (allocate-clusters! n)
+      (set! next-free-cluster (+ next-free-cluster n)))
+    (let allocate-tree ((directory (drive-root-directory drive)))
+      (for-each (lambda (entry)
+                  (cond ((fat-directory? entry)
+                         (fat-directory-set-first-cluster!
+                          entry next-free-cluster)
+                         (let ((entries (fat-directory-entries entry)))
+                           (allocate-clusters! (* 32 (length entries)))))
+                        ((fat-file? entry)
+                         (fat-file-set-first-cluster! entry next-free-cluster)
+                         (allocate-clusters! (fat-file-clusters entry)))
+                        (else
+                         (error "What?" entry))))
+                (fat-directory-entries directory))
+      (for-each allocate-tree
+                (filter fat-directory? (fat-directory-entries directory))))))
+
+(define (ascii-alphanumeric? char)
+  (or (char<=? #\0 char #\9)
+      (char<=? #\A char #\Z)
+      (char<=? #\a char #\z)))
+
+(define (valid-fat-filename-stem? str)
+  (and (<= (string-length str) 8)
+       (string-every? ascii-alphanumeric? str)))
+
+(define (valid-fat-filename-extension? str)
+  (and (<= (string-length str) 3)
+       (string-every? ascii-alphanumeric? str)))
+
+(define (encode-8.3-filename str)
+  (let* ((dot (string-index str #\.))
+         (stem (if dot (string-copy str 0 dot) str))
+         (ext (if dot (string-copy str (+ dot 1) (string-length str)) "")))
+    (unless (valid-fat-filename-stem? stem)
+      (error "stem" stem))
+    (unless (valid-fat-filename-extension? ext)
+      (error "ext" dot ext stem))
+    (if (and (valid-fat-filename-stem? stem)
+             (valid-fat-filename-extension? ext))
+        (string->utf8 (string-append (string-pad stem 8 #\space)
+                                     (string-pad ext 3 #\space)))
+        (error "Bad 8.3 filename" str))))
+
+(define (encode-directory-entry entry)
+  (let ((attributes (bitwise-ior #x20 (if (fat-directory? entry) #x10 0))))
+    (bytevector-append
+     (encode-8.3-filename (fat-directory-entry-name entry))
+     (u8 attributes)
+     (u8 0)  ; misc non-portable info
+     (u8 0)  ; misc non-portable info
+     (u16l 0)  ; create time-of-day
+     (u16l 0)  ; create date
+     (u16l 0)  ; access date
+     (u16l 0)  ; misc non-portable info
+     (u16l 0)  ; modify time-of-day
+     (u16l 0)  ; modify date
+     (u16l (if (fat-file? entry) (fat-file-first-cluster entry) 0))
+     (u32l (if (fat-file? entry) (fat-file-size entry) 0)))))
+
+(define (write-tree directory)
+  (write-bytevector
+   (bytevector-concatenate
+    (map encode-directory-entry
+         (fat-directory-entries directory))))
+  (for-each write-tree
+            (filter fat-directory? (fat-directory-entries directory))))
+
+(define (write-drive drive)
+  (write-tree (drive-root-directory drive)))
+
+(define (display-drive drive)
+  (define (emit nest str)
+    (write-string (make-string (* 2 nest) #\space))
+    (write-string str)
+    (newline))
+  (define (dump-directory-entries nest directory)
+    (for-each (lambda (entry)
+                (emit nest (fat-directory-entry-name entry))
+                (when (fat-directory? entry)
+                  (dump-directory-entries (+ nest 1) entry)))
+              (fat-directory-entries directory)))
+  (emit 0 (drive-letter drive))
+  (dump-directory-entries 1 (drive-root-directory drive)))
+
+(define (main)
+  (input)
+  (for-each build-file-allocation-table (get-used-drives))
+  (for-each display-drive (get-used-drives))
+  (for-each write-drive (get-used-drives)))
+
 (main)
-(dump-drive "c")
