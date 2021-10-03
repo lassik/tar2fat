@@ -63,6 +63,12 @@
 (define bytes/sector 512)  ; Do not change.
 (define sectors/cluster 8)
 
+(define physical-sectors/track 0)
+(define heads 0)
+
+(define (bytes->clusters bytes)
+  (ceiling (/ bytes (* bytes/sector sectors/cluster))))
+
 (define-record-type fat-directory
   (make-fat-directory* name entries)
   fat-directory?
@@ -137,12 +143,28 @@
   (make-drive* number (make-fat-directory* #f '())))
 
 (define (fat-directory-entry-name entry)
-  (cond ((fat-directory? entry)
-         (fat-directory-name entry))
-        ((fat-file? entry)
-         (fat-file-name entry))
-        (else
-         (error "What?" entry))))
+  (cond ((fat-directory? entry) (fat-directory-name entry))
+        ((fat-file? entry) (fat-file-name entry))
+        (else (error "What?" entry))))
+
+(define (fat-directory-entry-first-cluster entry)
+  (cond ((fat-directory? entry) (fat-directory-first-cluster entry))
+        ((fat-file? entry) (fat-file-first-cluster entry))
+        (else (error "What?" entry))))
+
+(define fat-directory-entry-size 32)
+
+(define fat-directory-entries/cluster
+  (ceiling (/ fat-directory-entry-size
+              (* bytes/sector sectors/cluster))))
+
+(define root-directory-entries 512)
+
+(define (fat-directory-entry-cluster-count entry)
+  (bytes->clusters
+   (cond ((fat-directory? entry) fat-directory-entry-size)
+         ((fat-file? entry) (fat-file-size entry))
+         (else (error "What?" entry)))))
 
 (define (fat-directory-insert-entry! directory entry)
   (let ((name (fat-directory-entry-name entry))
@@ -178,9 +200,6 @@
 
 (define (fat-file-size file)
   (bytevector-length (fat-file-contents file)))
-
-(define (fat-file-clusters file)
-  (ceiling (/ (fat-file-size file) (* bytes/sector sectors/cluster))))
 
 (define (tar-read-entry)
 
@@ -290,23 +309,54 @@
 
 (define (build-file-allocation-table drive)
   (let ((next-free-cluster 0))
-    (define (allocate-clusters! n)
-      (set! next-free-cluster (+ next-free-cluster n)))
+    (define (allocate! bytes)
+      (set! next-free-cluster (+ next-free-cluster (bytes->clusters bytes))))
     (let allocate-tree ((directory (drive-root-directory drive)))
       (for-each (lambda (entry)
                   (cond ((fat-directory? entry)
                          (fat-directory-set-first-cluster!
                           entry next-free-cluster)
                          (let ((entries (fat-directory-entries entry)))
-                           (allocate-clusters! (* 32 (length entries)))))
+                           (allocate! (* fat-directory-entry-size
+                                         (length entries)))))
                         ((fat-file? entry)
                          (fat-file-set-first-cluster! entry next-free-cluster)
-                         (allocate-clusters! (fat-file-clusters entry)))
+                         (allocate! (fat-file-size entry)))
                         (else
                          (error "What?" entry))))
                 (fat-directory-entries directory))
       (for-each allocate-tree
                 (filter fat-directory? (fat-directory-entries directory))))))
+
+(define (encode-file-allocation-table drive)
+  (let ((table (vector))
+        (next-free-cluster 0))
+    (define (ensure-room-for-entry!)
+      (let ((capacity (vector-length table)))
+        (when (= next-free-cluster capacity)
+          (let ((newtable (make-vector (max 16 (* 2 capacity)) 0)))
+            (vector-copy! newtable 0 table)
+            (set! table newtable)))))
+    (define (append-entry! i)
+      (ensure-room-for-entry!)
+      (vector-set! table next-free-cluster i)
+      (set! next-free-cluster (+ next-free-cluster 1)))
+    (define end-of-chain #xffff)
+    (let allocate-tree ((directory (drive-root-directory drive)))
+      (for-each (lambda (entry)
+                  (let* ((first (fat-directory-entry-first-cluster entry))
+                         (count (fat-directory-entry-cluster-count entry))
+                         (last  (+ first count -1)))
+                    (let loop ((this first))
+                      (if (>= this last)
+                          (append-entry! end-of-chain)
+                          (let ((next (+ this 1)))
+                            (append-entry! next)
+                            (loop next))))))
+                (fat-directory-entries directory))
+      (for-each allocate-tree
+                (filter fat-directory? (fat-directory-entries directory))))
+    table))
 
 (define (ascii-alphanumeric? char)
   (or (char<=? #\0 char #\9)
@@ -351,30 +401,75 @@
      (u16l (if (fat-file? entry) (fat-file-first-cluster entry) 0))
      (u32l (if (fat-file? entry) (fat-file-size entry) 0)))))
 
-(define (write-tree directory)
-  (write-bytevector
-   (bytevector-concatenate
-    (map encode-directory-entry
-         (fat-directory-entries directory))))
-  (for-each write-tree
+(define (write-directory-padding n-entries)
+  (define nulls (make-bytevector fat-directory-entry-size 0))
+  (when (> n-entries 0)
+    (write-bytevector nulls)
+    (write-directory-padding (- n-entries 1))))
+
+(define (write-directory-shallow directory min-entries)
+  (let ((entries (fat-directory-entries directory)))
+    (for-each write-bytevector (map encode-directory-entry entries))
+    (write-directory-padding (- min-entries (length entries)))))
+
+(define (write-directory-subtrees directory)
+  (write-directory-shallow directory 0)
+  (for-each write-directory-subtrees
             (filter fat-directory? (fat-directory-entries directory))))
 
+(define (write-file-allocation-table drive)
+  (vector-for-each (lambda (fat-entry) (write-bytevector (u16l fat-entry)))
+                   (encode-file-allocation-table drive)))
+
+(define (encode-volume-boot-record)
+  (bytevector-append
+   ;; 11 bytes
+   (bytevector #xeb #x3c #x90)  ; x86 jump instruction
+   (string->utf8 "TAR2FAT ")  ; OEM Name
+   ;; BIOS parameter block - DOS 2.0 values:
+   (u16l bytes/sector)
+   (u8   sectors/cluster)
+   (u16l 1) ; reserved-sectors
+   (u8   2) ; fats
+   (u16l root-directory-entries)
+   (u16l 0) ; sectors
+   (u8   #xf8)  ; Media descriptor: Hard disk partition.
+   (u16l 200) ; sectors/fat
+   ;; BIOS parameter block - DOS 3.31 values:
+   (u16l physical-sectors/track)
+   (u16l heads)
+   (u32l 0) ; hidden-sectors
+   (u32l 0) ; large-sectors
+   ;; Boot code:
+   (make-bytevector 473 0)
+   ;; Physical drive number:
+   (u8 0)
+   ;; Boot sector signature:
+   (u8 #x55)
+   (u8 #xaa)))
+
 (define (write-drive drive)
-  (write-tree (drive-root-directory drive)))
+  (write-bytevector (encode-volume-boot-record))
+  (write-file-allocation-table drive)
+  (write-file-allocation-table drive)
+  (write-directory-shallow (drive-root-directory drive)
+                           root-directory-entries)
+  (write-directory-subtrees (drive-root-directory drive)))
 
 (define (display-drive drive)
-  (define (emit nest str)
-    (write-string (make-string (* 2 nest) #\space))
-    (write-string str)
-    (newline))
-  (define (dump-directory-entries nest directory)
-    (for-each (lambda (entry)
-                (emit nest (fat-directory-entry-name entry))
-                (when (fat-directory? entry)
-                  (dump-directory-entries (+ nest 1) entry)))
-              (fat-directory-entries directory)))
-  (emit 0 (drive-letter drive))
-  (dump-directory-entries 1 (drive-root-directory drive)))
+  (parameterize ((current-output-port (current-error-port)))
+    (define (emit nest str)
+      (write-string (make-string (* 2 nest) #\space))
+      (write-string str)
+      (newline))
+    (define (dump-directory-entries nest directory)
+      (for-each (lambda (entry)
+                  (emit nest (fat-directory-entry-name entry))
+                  (when (fat-directory? entry)
+                    (dump-directory-entries (+ nest 1) entry)))
+                (fat-directory-entries directory)))
+    (emit 0 (drive-letter drive))
+    (dump-directory-entries 1 (drive-root-directory drive))))
 
 (define (main)
   (input)
